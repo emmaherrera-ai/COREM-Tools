@@ -1,0 +1,1228 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection, query, where, addDoc, serverTimestamp } from 'firebase/firestore';
+
+// Tailwind CSS is assumed to be available
+// For a simple deploy, you can include the script in your public/index.html file:
+// <script src="https://cdn.tailwindcss.com"></script>
+
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Mapeo para los estados de las tareas
+const statusMap = {
+  'to-do': 'To Do',
+  'in-progress': 'En Proceso',
+  'done': 'Completada',
+};
+
+// Opciones predefinidas para la fecha de entrega
+const dateOptions = [
+  { label: 'Hoy', value: 0 },
+  { label: 'Mañana', value: 1 },
+  { label: '3 Días', value: 3 },
+  { label: '4 Días', value: 4 },
+  { label: '5 Días', value: 5 },
+];
+
+function App() {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
+  const [tasks, setTasks] = useState([]);
+  const [kanbanData, setKanbanData] = useState({
+    'to-do': [],
+    'in-progress': [],
+    'done': [],
+  });
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [newTask, setNewTask] = useState({
+    title: '',
+    description: '',
+    infoAdicional: {
+      terminal: '',
+      operacion: '',
+      consecutivo: '',
+      cotizacion: '',
+      monto: '',
+    },
+    dueDate: '',
+  });
+  const [selectedTask, setSelectedTask] = useState(null);
+  const [isTaskDetailModalOpen, setIsTaskDetailModalOpen] = useState(false);
+  const [taskHistory, setTaskHistory] = useState([]);
+  const [newProjectName, setNewProjectName] = useState('');
+  const [showProjectModal, setShowProjectModal] = useState(false);
+  const [currentView, setCurrentView] = useState('dashboard'); // 'dashboard' or 'kanban'
+  const [showCompletedTasks, setShowCompletedTasks] = useState(true);
+  const [taskUpdateData, setTaskUpdateData] = useState({ comment: '' });
+  const [isUpdateModalOpen, setIsUpdateModalOpen] = useState(false);
+  const [taskToUpdate, setTaskToUpdate] = useState(null);
+  const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState(null);
+  const [isConfirmTaskModalOpen, setIsConfirmTaskModalOpen] = useState(false);
+  const [taskToConfirm, setTaskToConfirm] = useState(null);
+  const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
+  const projectDropdownRef = useRef(null);
+
+  // Estados y funciones para el avatar
+  const [userAvatar, setUserAvatar] = useState('🧑‍💻');
+  const [showUserInfoModal, setShowUserInfoModal] = useState(false);
+  const defaultEmojis = ['💻', '🚀', '🌟', '💡', '🤖', '👾', '🌈', '🎉'];
+
+  const [darkMode, setDarkMode] = useState(() => {
+    // Leer la preferencia de localStorage al iniciar
+    const savedMode = localStorage.getItem('darkMode');
+    return savedMode === 'true' ? true : false;
+  });
+
+  // --- Novedad: Lógica del Asistente de Búsqueda (Clip) ---
+  const [isAssistantModalOpen, setIsAssistantModalOpen] = useState(false);
+  const [assistantQuery, setAssistantQuery] = useState('');
+  const [assistantResponse, setAssistantResponse] = useState('');
+  const [isAssistantLoading, setIsAssistantLoading] = useState(false);
+  const [chatHistory, setChatHistory] = useState([]);
+  const responseRef = useRef(null);
+  
+  // --- Novedad: Estado para el menú de acción flotante ---
+  const [showFloatingActionMenu, setShowFloatingActionMenu] = useState(false);
+  
+  // --- Novedad: Estado para la animación de rebote del botón Clip ---
+  const [isBouncing, setIsBouncing] = useState(true);
+
+  // useEffect para la animación de rebote del botón Clip
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setIsBouncing(false);
+    }, 3000); // 3 segundos
+    return () => clearTimeout(timer);
+  }, []);
+
+  const toggleDarkMode = () => {
+    setDarkMode(prevMode => {
+      const newMode = !prevMode;
+      localStorage.setItem('darkMode', newMode);
+      return newMode;
+    });
+  };
+
+  useEffect(() => {
+    if (responseRef.current) {
+      responseRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatHistory]);
+  
+  // Función para manejar la búsqueda del asistente
+  const handleAssistantSearch = async (e) => {
+    e.preventDefault();
+    if (!assistantQuery.trim()) return;
+
+    setIsAssistantLoading(true);
+    setAssistantResponse('');
+    setChatHistory(prev => [...prev, { role: 'user', text: assistantQuery }]);
+    
+    // Guardamos la consulta del usuario antes de enviarla
+    const userPrompt = assistantQuery;
+    setAssistantQuery('');
+
+    // Preparamos el contexto para el modelo de IA
+    const projectsList = projects.map(p => ({
+      id: p.id,
+      name: p.name,
+    }));
+    const tasksList = tasks.map(t => ({
+      id: t.id,
+      title: t.title,
+      description: t.description,
+      status: t.status,
+      dueDate: t.dueDate,
+      projectName: t.projectName,
+      infoAdicional: t.infoAdicional,
+    }));
+    
+    // Le decimos al modelo que actúe como un asistente de búsqueda.
+    const prompt = `Actúa como un asistente de búsqueda para una aplicación de gestión de proyectos. El usuario te hará preguntas sobre sus proyectos y tareas. Proporciona respuestas concisas y directas basadas en la información que te daré.
+    
+    Tus datos disponibles son los siguientes (en formato JSON):
+    
+    - Proyectos: ${JSON.stringify(projectsList)}
+    - Tareas: ${JSON.stringify(tasksList)}
+
+    Pregunta del usuario: "${userPrompt}"
+    `;
+
+    const apiHistory = [{ role: "user", parts: [{ text: prompt }] }];
+    const payload = { contents: apiHistory };
+    const apiKey = "";
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+    try {
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (result.candidates && result.candidates.length > 0) {
+        const text = result.candidates[0].content.parts[0].text;
+        setAssistantResponse(text);
+        setChatHistory(prev => [...prev, { role: 'assistant', text: text }]);
+      } else {
+        setAssistantResponse("No pude encontrar una respuesta con la información disponible. Intenta una pregunta diferente.");
+        setChatHistory(prev => [...prev, { role: 'assistant', text: "No pude encontrar una respuesta con la información disponible. Intenta una pregunta diferente." }]);
+      }
+    } catch (error) {
+      console.error("Error al llamar a la API de Gemini:", error);
+      setAssistantResponse("Ocurrió un error al procesar tu solicitud. Inténtalo de nuevo más tarde.");
+      setChatHistory(prev => [...prev, { role: 'assistant', text: "Ocurrió un error al procesar tu solicitud. Inténtalo de nuevo más tarde." }]);
+    } finally {
+      setIsAssistantLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // Inicializar Firebase
+    const app = initializeApp(firebaseConfig);
+    const firestore = getFirestore(app);
+    const authentication = getAuth(app);
+    setDb(firestore);
+    setAuth(authentication);
+
+    // Iniciar sesión con token personalizado o de forma anónima
+    onAuthStateChanged(authentication, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(authentication, initialAuthToken);
+          } else {
+            await signInAnonymously(authentication);
+          }
+        } catch (error) {
+          console.error("Error de autenticación de Firebase:", error);
+        }
+      }
+      setIsAuthReady(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (db && userId) {
+      const projectsRef = collection(db, 'artifacts', appId, 'users', userId, 'projects');
+      const projectsUnsub = onSnapshot(projectsRef, (snapshot) => {
+        const fetchedProjects = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setProjects(fetchedProjects);
+        if (fetchedProjects.length > 0 && !selectedProjectId) {
+          setSelectedProjectId(fetchedProjects[0].id);
+        }
+      }, (error) => {
+        console.error("Error al obtener proyectos:", error);
+      });
+
+      const historyRef = collection(db, 'artifacts', appId, 'users', userId, 'taskHistory');
+      const historyUnsub = onSnapshot(historyRef, (snapshot) => {
+        const fetchedHistory = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setTaskHistory(fetchedHistory.sort((a, b) => b.timestamp.toDate() - a.timestamp.toDate()));
+      }, (error) => {
+        console.error("Error al obtener el historial de tareas:", error);
+      });
+      
+      const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'userData', 'profile');
+      const userUnsubscribe = onSnapshot(userDocRef, (docSnap) => {
+          if (docSnap.exists() && docSnap.data().avatar) {
+              setUserAvatar(docSnap.data().avatar);
+          }
+      });
+
+      return () => {
+        projectsUnsub();
+        historyUnsub();
+        userUnsubscribe();
+      };
+    }
+  }, [db, userId, appId, selectedProjectId]);
+
+  useEffect(() => {
+    if (db && userId && selectedProjectId) {
+      const tasksRef = collection(db, 'artifacts', appId, 'users', userId, 'tasks');
+      const tasksQuery = query(tasksRef, where('projectId', '==', selectedProjectId));
+      const tasksUnsub = onSnapshot(tasksQuery, (snapshot) => {
+        const fetchedTasks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setTasks(fetchedTasks);
+        organizeTasksForKanban(fetchedTasks);
+      }, (error) => {
+        console.error("Error al obtener tareas:", error);
+      });
+
+      return tasksUnsub;
+    }
+  }, [db, userId, appId, selectedProjectId]);
+
+  // Manejar clics fuera del dropdown
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (projectDropdownRef.current && !projectDropdownRef.current.contains(event.target)) {
+        setIsProjectDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [projectDropdownRef]);
+
+
+  const organizeTasksForKanban = (tasks) => {
+    const newKanbanData = {
+      'to-do': tasks.filter(task => task.status === 'to-do'),
+      'in-progress': tasks.filter(task => task.status === 'in-progress'),
+      'done': tasks.filter(task => task.status === 'done'),
+    };
+    setKanbanData(newKanbanData);
+  };
+
+  const handleCreateProject = async () => {
+    if (!newProjectName.trim() || !db || !userId) {
+      console.error("Falta el nombre del proyecto, db o userId.");
+      return;
+    }
+    try {
+      const projectsRef = collection(db, 'artifacts', appId, 'users', userId, 'projects');
+      await addDoc(projectsRef, {
+        name: newProjectName,
+        createdAt: new Date(),
+        userId: userId,
+      });
+      setNewProjectName('');
+      setShowProjectModal(false);
+    } catch (error) {
+      console.error("Error al crear el proyecto:", error);
+    }
+  };
+
+  const handlePreCreateTask = (e) => {
+    e.preventDefault();
+    if (!newTask.title.trim() || !selectedProjectId) {
+      return;
+    }
+    // Abrir el modal de confirmación con los datos de la tarea
+    setTaskToConfirm(newTask);
+    setIsConfirmTaskModalOpen(true);
+  };
+
+  const handleConfirmCreateTask = async () => {
+    if (!taskToConfirm || !db || !userId || !selectedProjectId) {
+      return;
+    }
+
+    try {
+      const projectsRef = collection(db, 'artifacts', appId, 'users', userId, 'projects');
+      const projectDoc = await getDoc(doc(projectsRef, selectedProjectId));
+      const projectName = projectDoc.exists() ? projectDoc.data().name : 'N/A';
+      
+      const tasksRef = collection(db, 'artifacts', appId, 'users', userId, 'tasks');
+      const taskPayload = {
+        ...taskToConfirm,
+        status: 'to-do',
+        projectId: selectedProjectId,
+        projectName: projectName, // Añadir nombre del proyecto
+        createdAt: new Date(),
+        userId: userId,
+        infoAdicional: {
+          ...taskToConfirm.infoAdicional,
+          monto: parseFloat(taskToConfirm.infoAdicional.monto.replace(/,/g, '') || 0),
+        },
+        history: [{
+          status: 'to-do',
+          timestamp: new Date(),
+          change: 'Tarea creada',
+          comment: '',
+        }],
+      };
+      await addDoc(tasksRef, taskPayload);
+      setNewTask({
+        title: '',
+        description: '',
+        infoAdicional: { terminal: '', operacion: '', consecutivo: '', cotizacion: '', monto: '' },
+        dueDate: '',
+      });
+      setIsModalOpen(false);
+      setIsConfirmTaskModalOpen(false);
+      setTaskToConfirm(null);
+    } catch (error) {
+      console.error("Error al crear la tarea:", error);
+    }
+  };
+
+  const handleConfirmUpdate = async () => {
+    if (taskToUpdate) {
+      await handleUpdateTaskStatus(taskToUpdate.taskId, taskToUpdate.newStatus, taskUpdateData.comment);
+      closeModal();
+    }
+  };
+
+  const handleUpdateTaskStatus = async (taskId, newStatus, comment) => {
+    if (!db || !userId) return;
+
+    try {
+      const taskDocRef = doc(db, 'artifacts', appId, 'users', userId, 'tasks', taskId);
+      const taskSnapshot = await getDoc(taskDocRef);
+      if (!taskSnapshot.exists()) return;
+      const currentTask = taskSnapshot.data();
+
+      const newHistoryEntry = {
+        status: newStatus,
+        timestamp: new Date(),
+        change: `Estado cambiado de '${statusMap[currentTask.status]}' a '${statusMap[newStatus]}'`,
+        comment: comment,
+      };
+
+      await updateDoc(taskDocRef, {
+        status: newStatus,
+        history: [...currentTask.history, newHistoryEntry],
+      });
+
+      const historyRef = collection(db, 'artifacts', appId, 'users', userId, 'taskHistory');
+      await addDoc(historyRef, {
+        taskId: taskId,
+        taskTitle: currentTask.title,
+        fromStatus: currentTask.status,
+        toStatus: newStatus,
+        timestamp: new Date(),
+        userId: userId,
+        projectName: currentTask.projectName,
+      });
+
+    } catch (error) {
+      console.error("Error al actualizar el estado de la tarea:", error);
+    }
+  };
+
+  const handleDragStart = (e, taskId) => {
+    e.dataTransfer.setData("taskId", taskId);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+  };
+
+  const handleDrop = (e, status) => {
+    e.preventDefault();
+    const taskId = e.dataTransfer.getData("taskId");
+    const task = tasks.find(t => t.id === taskId);
+    if (task && task.status !== status) {
+      setTaskToUpdate({ taskId, newStatus: status });
+      setIsUpdateModalOpen(true);
+    }
+  };
+
+  const handleDateChange = (daysToAdd) => {
+    const date = new Date();
+    date.setDate(date.getDate() + daysToAdd);
+    setNewTask(prev => ({ ...prev, dueDate: date.toISOString().split('T')[0] }));
+  };
+
+  const handleCustomDateChange = (e) => {
+    setNewTask(prev => ({ ...prev, dueDate: e.target.value }));
+  };
+
+  const handleMontoChange = (e) => {
+    const rawValue = e.target.value.replace(/[^0-9.]/g, ''); // Permite solo números y punto
+    const formattedValue = new Intl.NumberFormat('es-MX').format(rawValue);
+    setNewTask(prev => ({
+      ...prev,
+      infoAdicional: { ...prev.infoAdicional, monto: formattedValue }
+    }));
+  };
+
+  const openTaskDetailModal = (task) => {
+    setSelectedTask(task);
+    setIsTaskDetailModalOpen(true);
+  };
+
+  const openHistoryAuditModal = (historyItem) => {
+    const taskDetails = tasks.find(t => t.id === historyItem.taskId);
+    if (taskDetails) {
+      setSelectedHistoryItem({
+        ...historyItem,
+        fullHistory: taskDetails.history,
+      });
+      setHistoryModalOpen(true);
+    }
+  };
+
+  const closeModal = () => {
+    setIsModalOpen(false);
+    setIsTaskDetailModalOpen(false);
+    setShowProjectModal(false);
+    setIsUpdateModalOpen(false);
+    setHistoryModalOpen(false);
+    setIsConfirmTaskModalOpen(false);
+    setTaskToConfirm(null);
+    setShowUserInfoModal(false);
+    setIsAssistantModalOpen(false);
+    // --- Novedad: Cerrar el menú flotante al cerrar cualquier modal ---
+    setShowFloatingActionMenu(false);
+    setNewTask({
+      title: '',
+      description: '',
+      infoAdicional: { terminal: '', operacion: '', consecutivo: '', cotizacion: '', monto: '' },
+      dueDate: '',
+    });
+    setTaskUpdateData({ comment: '' });
+  };
+  
+  // Funciones para el avatar
+  const handleUpdateAvatar = async (newAvatar) => {
+    if (!db || !userId) return;
+
+    const userDocRef = doc(db, 'artifacts', appId, 'users', userId, 'userData', 'profile');
+    try {
+        await setDoc(userDocRef, { avatar: newAvatar }, { merge: true });
+        setUserAvatar(newAvatar);
+    } catch (error) {
+        console.error('Error al actualizar el avatar:', error);
+    }
+  };
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            handleUpdateAvatar(reader.result);
+        };
+        reader.readAsDataURL(file);
+    }
+  };
+
+  const getDueDateClass = (dueDate) => {
+    if (!dueDate) return '';
+    const now = new Date();
+    const due = new Date(dueDate);
+    const diffTime = due - now;
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    if (diffDays <= 1) return 'bg-red-500';
+    if (diffDays <= 3) return 'bg-yellow-500';
+    // Se ha cambiado de 'bg-[#0038A6]' a 'bg-sky-600' para un tono más suave
+    return 'bg-sky-600'; 
+  };
+
+  const renderKanbanColumn = (status) => (
+    <div
+      key={status}
+      className="bg-slate-50 dark:bg-slate-800 p-4 rounded-lg shadow-inner flex-1 flex flex-col gap-4 min-h-[300px]"
+      onDragOver={handleDragOver}
+      onDrop={(e) => handleDrop(e, status)}
+    >
+      <h3 className="text-lg font-semibold text-slate-800 dark:text-slate-200 border-b pb-2 border-slate-200 dark:border-slate-700">{statusMap[status]}</h3>
+      {kanbanData[status]?.map(task => {
+        if (!showCompletedTasks && task.status === 'done') return null;
+        return (
+          <div
+            key={task.id}
+            className="bg-white dark:bg-slate-700 p-4 rounded-md shadow-md cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-600 transition-colors duration-200"
+            draggable="true"
+            onDragStart={(e) => handleDragStart(e, task.id)}
+            onClick={() => openTaskDetailModal(task)}
+          >
+            <div className="flex justify-between items-center mb-2">
+              <p className="font-medium text-slate-800 dark:text-slate-100">{task.title}</p>
+              {task.dueDate && (
+                <span className={`text-xs font-semibold text-white ${getDueDateClass(task.dueDate)} rounded-full px-2 py-1`}>
+                  {new Date(task.dueDate).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+            <p className="text-sm text-slate-500 dark:text-slate-400">{task.description}</p>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const getUpcomingTasks = () => {
+    const now = new Date();
+    return tasks.filter(task => {
+      if (task.status === 'done') return false;
+      const dueDate = new Date(task.dueDate);
+      const diffTime = dueDate.getTime() - now.getTime();
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      return diffDays <= 7 && diffDays >= 0;
+    }).sort((a,b) => new Date(a.dueDate) - new Date(b.dueDate));
+  };
+
+  const totalTasks = tasks.length;
+  const tasksToDo = tasks.filter(t => t.status === 'to-do').length;
+  const tasksInProgress = tasks.filter(t => t.status === 'in-progress').length;
+  const tasksDone = tasks.filter(t => t.status === 'done').length;
+  const upcomingTasks = getUpcomingTasks();
+
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-slate-50 dark:bg-slate-900">
+        <div className="text-center text-slate-500 dark:text-slate-400">Cargando aplicación...</div>
+      </div>
+    );
+  }
+
+  const selectedProject = projects.find(p => p.id === selectedProjectId);
+
+  const dashboardContent = (
+    <div className="p-6">
+      <div className="flex flex-col md:flex-row md:items-center justify-between mb-6">
+        <div className="relative" ref={projectDropdownRef}>
+          <button
+            onClick={() => setIsProjectDropdownOpen(!isProjectDropdownOpen)}
+            className="flex items-center gap-2 text-3xl font-bold text-slate-900 dark:text-white mb-4 md:mb-0 bg-white dark:bg-slate-800 p-2 rounded-lg shadow-sm hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
+          >
+            Dashboard: <span className="text-sky-600 dark:text-white">{selectedProject ? selectedProject.name : 'Seleccionar Proyecto'}</span>
+            <svg xmlns="http://www.w3.org/2000/svg" className={`h-6 w-6 transform transition-transform ${isProjectDropdownOpen ? 'rotate-180' : 'rotate-0'} text-slate-700 dark:text-slate-300`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+          {isProjectDropdownOpen && (
+            <div className="absolute top-full left-0 mt-2 w-64 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-md shadow-lg z-20">
+              <div className="py-1">
+                {projects.map(project => (
+                  <button
+                    key={project.id}
+                    onClick={() => {
+                      setSelectedProjectId(project.id);
+                      setIsProjectDropdownOpen(false);
+                    }}
+                    className="block w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
+                  >
+                    {project.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300">Total de Tareas</h3>
+          {/* Se ha cambiado de 'text-[#0038A6]' a 'text-sky-600' */}
+          <p className="text-4xl font-bold text-sky-600">{totalTasks}</p>
+        </div>
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300">Pendientes</h3>
+          <p className="text-4xl font-bold text-slate-800 dark:text-slate-100">{tasksToDo}</p>
+        </div>
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300">En Proceso</h3>
+          <p className="text-4xl font-bold text-yellow-600">{tasksInProgress}</p>
+        </div>
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <h3 className="text-lg font-semibold text-slate-700 dark:text-slate-300">Completadas</h3>
+          <p className="text-4xl font-bold text-green-600">{tasksDone}</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <div className="flex justify-between items-center mb-4">
+            <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100">Próximas Tareas</h3>
+            {/* Se ha cambiado de 'bg-[#0038A6]' a 'bg-sky-600' */}
+            <span className="text-sm font-medium text-white bg-sky-600 rounded-full px-3 py-1">
+              {upcomingTasks.length}
+            </span>
+          </div>
+          {upcomingTasks.length > 0 ? (
+            <ul className="space-y-4">
+              {upcomingTasks.map(task => (
+                <li key={task.id} className="border-l-4 border-sky-600 pl-4 py-2 bg-slate-50 dark:bg-slate-700 rounded-md">
+                  <p className="font-semibold text-slate-700 dark:text-slate-200">{task.title}</p>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    Fecha de entrega: {new Date(task.dueDate).toLocaleDateString()}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-slate-500 dark:text-slate-400">No hay tareas próximas a vencer.</p>
+          )}
+        </div>
+        <div className="bg-white dark:bg-slate-800 p-6 rounded-lg shadow-md">
+          <h3 className="text-lg font-bold text-slate-800 dark:text-slate-100 mb-4">Historial Reciente</h3>
+          <ul className="space-y-2">
+            {taskHistory.slice(0, 6).map((historyItem, index) => (
+              <li key={index} className="border-b dark:border-slate-700 pb-2 last:border-b-0">
+                <p className="text-sm font-medium text-slate-800 dark:text-slate-100">{historyItem.taskTitle}</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {/* Se ha cambiado de 'text-[#0038A6]' a 'text-sky-600' */}
+                  <span className="font-semibold text-sky-600">{historyItem.projectName}</span>
+                  : {historyItem.change}
+                </p>
+                <button
+                  onClick={() => openHistoryAuditModal(historyItem)}
+                  className="mt-1 text-xs text-sky-600 hover:text-sky-700 font-medium"
+                >
+                  Ver Auditoría
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+
+  const kanbanContent = (
+    <div className="flex flex-col lg:flex-row p-6 gap-6">
+      <aside className="w-full lg:w-1/4">
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-lg shadow-md mb-6">
+          <h2 className="text-xl font-bold mb-4 text-slate-800 dark:text-slate-100">Proyectos</h2>
+          <div className="flex flex-col gap-2">
+            {projects.map(project => (
+              <button
+                key={project.id}
+                onClick={() => setSelectedProjectId(project.id)}
+                // Se ha cambiado de 'bg-[#0038A6]' a 'bg-sky-600'
+                className={`text-left p-3 rounded-lg transition-colors duration-200 ${selectedProjectId === project.id ? 'bg-sky-600 text-white shadow-md' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}
+              >
+                {project.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white dark:bg-slate-800 p-4 rounded-lg shadow-md">
+          <h2 className="text-xl font-bold mb-4 text-slate-800 dark:text-slate-100">Historial de Tareas</h2>
+          <div className="flex flex-col gap-2 max-h-96 overflow-y-auto">
+            {taskHistory.length > 0 ? (
+              taskHistory.slice(0, 6).map((historyItem, index) => (
+                <div key={index} className="border-b dark:border-slate-700 pb-2 last:border-b-0">
+                  <p className="text-sm font-medium text-slate-800 dark:text-slate-100">{historyItem.taskTitle}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {/* Se ha cambiado de 'text-[#0038A6]' a 'text-sky-600' */}
+                    <span className="font-semibold text-sky-600">{historyItem.projectName}</span>: {historyItem.change} - {new Date(historyItem.timestamp.seconds * 1000).toLocaleString()}
+                  </p>
+                  <button
+                    onClick={() => openHistoryAuditModal(historyItem)}
+                    className="mt-1 text-xs text-sky-600 hover:text-sky-700 font-medium"
+                  >
+                    Ver Auditoría
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p className="text-slate-500 dark:text-slate-400 text-sm">No hay historial.</p>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      <main className="w-full lg:w-3/4">
+        {selectedProject ? (
+          <>
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-3xl font-bold text-slate-900 dark:text-white">{selectedProject.name}</h2>
+              <button
+                onClick={() => setShowCompletedTasks(!showCompletedTasks)}
+                className="bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 font-semibold py-2 px-4 rounded-full hover:bg-slate-300 dark:hover:bg-slate-600 transition-colors"
+              >
+                {showCompletedTasks ? 'Ocultar Completadas' : 'Mostrar Completadas'}
+              </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {Object.keys(statusMap).map(renderKanbanColumn)}
+            </div>
+          </>
+        ) : (
+          <div className="flex items-center justify-center p-10 bg-white dark:bg-slate-800 rounded-lg shadow-md">
+            <p className="text-lg text-slate-500 dark:text-slate-400">
+              Selecciona un proyecto o crea uno nuevo para empezar.
+            </p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+
+  return (
+    <div className={`min-h-screen font-sans ${darkMode ? 'dark bg-slate-900 text-slate-100' : 'bg-slate-50 text-slate-800'}`}>
+      {/* Header */}
+      <header className="p-4 bg-white dark:bg-slate-800 shadow-sm flex items-center justify-between sticky top-0 z-10">
+        {/* Se ha cambiado de 'text-[#0038A6]' a 'text-sky-600' */}
+        <h1 className="text-2xl font-bold text-sky-600 dark:text-white">COREM-Tasks</h1>
+        <nav className="flex items-center gap-4">
+          <button
+            onClick={() => setCurrentView('dashboard')}
+            // Se ha cambiado de 'bg-[#0038A6]' a 'bg-sky-600'
+            className={`px-4 py-2 rounded-full font-semibold transition-colors ${currentView === 'dashboard' ? 'bg-sky-600 text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}
+          >
+            Inicio
+          </button>
+          <button
+            onClick={() => setCurrentView('kanban')}
+            // Se ha cambiado de 'bg-[#0038A6]' a 'bg-sky-600'
+            className={`px-4 py-2 rounded-full font-semibold transition-colors ${currentView === 'kanban' ? 'bg-sky-600 text-white' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'}`}
+          >
+            Kanban
+          </button>
+        </nav>
+        <div className="flex items-center gap-4">
+          <button
+            onClick={toggleDarkMode}
+            className="p-2 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors"
+          >
+            {darkMode ? (
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.106a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.06l1.59-1.591zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5h2.25a.75.75 0 01.75.75zM17.844 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.06 1.06l1.59 1.591zM12 18.75a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0v-2.25a.75.75 0 01.75-.75zM4.293 17.844a.75.75 0 001.06 1.06l1.591-1.59a.75.75 0 10-1.06-1.06l-1.59 1.591zM2.25 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H3a.75.75 0 01-.75-.75zM6.106 5.106a.75.75 0 00-1.06 1.06l1.59 1.591a.75.75 0 101.06-1.06l-1.59-1.591z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+                <path fillRule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.66.75.75 0 01.981.265A10.547 10.547 0 0118 20.25a10.5 10.5 0 01-10.5-10.5c0-4.368 2.126-8.204 5.381-10.177a.75.75 0 01.819.162z" clipRule="evenodd" />
+              </svg>
+            )}
+          </button>
+          {/* Avatar del usuario */}
+          <button onClick={() => setShowUserInfoModal(true)} className="p-1 rounded-full bg-sky-600 dark:bg-sky-600 text-white hover:bg-sky-700 dark:hover:bg-sky-700 transition-colors shadow-md flex items-center justify-center h-10 w-10 text-xl font-bold">
+            {userAvatar}
+          </button>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="container mx-auto py-8">
+        {currentView === 'dashboard' ? dashboardContent : kanbanContent}
+      </main>
+
+      {/* Floating Action Button (FAB) */}
+      <div className="fixed bottom-6 right-6 z-20 flex flex-col items-end gap-3">
+        {showFloatingActionMenu && (
+          <div className="flex flex-col items-end gap-3 transition-all duration-300 ease-in-out">
+            <button
+              onClick={() => {
+                setShowProjectModal(true);
+                setShowFloatingActionMenu(false);
+              }}
+              className="flex items-center gap-2 p-3 bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 rounded-full shadow-lg hover:bg-slate-100 dark:hover:bg-slate-600 transition-colors"
+            >
+              <span className="font-semibold">Nuevo Proyecto</span>
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-sky-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 13h6m-3-3v6m5 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+            </button>
+            <button
+              onClick={() => {
+                setIsModalOpen(true);
+                setShowFloatingActionMenu(false);
+              }}
+              className="flex items-center gap-2 p-3 bg-white dark:bg-slate-700 text-slate-800 dark:text-slate-100 rounded-full shadow-lg hover:bg-slate-100 dark:hover:bg-slate-600 transition-colors"
+            >
+              <span className="font-semibold">Nueva Tarea</span>
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-sky-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        <button
+          onClick={() => setShowFloatingActionMenu(!showFloatingActionMenu)}
+          className="bg-sky-600 text-white rounded-full p-4 shadow-xl hover:bg-sky-700 transition-colors transform hover:scale-110 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 focus:ring-offset-slate-50 dark:focus:ring-offset-slate-900"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            {showFloatingActionMenu ? (
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            ) : (
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+            )}
+          </svg>
+        </button>
+      </div>
+
+      {/* Botón flotante para el asistente de búsqueda (Clip) */}
+      <button
+        onClick={() => setIsAssistantModalOpen(true)}
+        className={`fixed bottom-6 left-6 z-20 p-4 bg-sky-600 text-white rounded-full shadow-xl hover:bg-sky-700 transition-all transform focus:outline-none focus:ring-2 focus:ring-sky-500 focus:ring-offset-2 focus:ring-offset-slate-50 dark:focus:ring-offset-slate-900 ${isBouncing ? 'animate-bounce' : ''}`}
+        onAnimationEnd={() => setIsBouncing(false)}
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-8 w-8" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M7 11.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 0 1h-2a.5.5 0 0 1-.5-.5zm.5 2.5a.5.5 0 0 0 0 1h2a.5.5 0 0 0 0-1h-2zM8 2a.5.5 0 0 1 .5.5v1.5h-.001a4.5 4.5 0 0 0-3.212 7.707 5.5 5.5 0 0 1-.785 8.358A.5.5 0 0 1 5 19.5h14a.5.5 0 0 1 .302.894 5.5 5.5 0 0 1-.785-8.358A4.5 4.5 0 0 0 15.5 4H15V2.5a.5.5 0 0 1 1 0V4h.5a.5.5 0 0 1 0 1H16v.5a.5.5 0 0 1-1 0V5h-1.5a.5.5 0 0 1 0-1H14V2.5a.5.5 0 0 1 .5-.5zM12 3a.5.5 0 0 1 .5.5v1h-.5a.5.5 0 0 1 0 1h.5v.5a.5.5 0 0 1-1 0V5H11a.5.5 0 0 1 0-1h.5V3.5a.5.5 0 0 1 .5-.5zm.5 1h1V3.5a.5.5 0 0 1-1 0V4.5zM10.5 4h1V3.5a.5.5 0 0 1-1 0V4.5zM9 11a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zM15 11a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3zm.5 1a.5.5 0 0 0 0 1h-1a.5.5 0 0 0 0-1h1zm-5 0a.5.5 0 0 0 0 1h-1a.5.5 0 0 0 0-1h1z" />
+        </svg>
+      </button>
+
+      {/* Modal para crear tarea */}
+      {isModalOpen && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-2xl">
+            <h2 className="text-2xl font-bold mb-4 text-slate-800 dark:text-slate-100">Nueva Tarea</h2>
+            <form onSubmit={handlePreCreateTask}>
+              <div className="mb-4">
+                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2" htmlFor="title">Título</label>
+                <input
+                  type="text"
+                  id="title"
+                  value={newTask.title}
+                  onChange={(e) => setNewTask({ ...newTask, title: e.target.value })}
+                  className="w-full px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg focus:ring-sky-500 focus:border-sky-500 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-100"
+                  required
+                />
+              </div>
+              <div className="mb-4">
+                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2" htmlFor="description">Descripción</label>
+                <textarea
+                  id="description"
+                  value={newTask.description}
+                  onChange={(e) => setNewTask({ ...newTask, description: e.target.value })}
+                  className="w-full px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg focus:ring-sky-500 focus:border-sky-500 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-100"
+                ></textarea>
+              </div>
+              <div className="mb-4">
+                <p className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Fecha de entrega</p>
+                <div className="flex flex-wrap gap-2 mb-2">
+                  {dateOptions.map(option => (
+                    <button
+                      key={option.label}
+                      type="button"
+                      onClick={() => handleDateChange(option.value)}
+                      className="px-4 py-2 rounded-full bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 hover:bg-slate-300 dark:hover:bg-slate-600 transition-colors"
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="date"
+                  value={newTask.dueDate}
+                  onChange={handleCustomDateChange}
+                  className="w-full px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg focus:ring-sky-500 focus:border-sky-500 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-100"
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Terminal</label>
+                  <input type="text" className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600" value={newTask.infoAdicional.terminal} onChange={(e) => setNewTask({ ...newTask, infoAdicional: { ...newTask.infoAdicional, terminal: e.target.value } })} />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Operación</label>
+                  <input type="text" className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600" value={newTask.infoAdicional.operacion} onChange={(e) => setNewTask({ ...newTask, infoAdicional: { ...newTask.infoAdicional, operacion: e.target.value } })} />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Consecutivo</label>
+                  <input type="text" className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600" value={newTask.infoAdicional.consecutivo} onChange={(e) => setNewTask({ ...newTask, infoAdicional: { ...newTask.infoAdicional, consecutivo: e.target.value } })} />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Cotización</label>
+                  <input type="text" className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600" value={newTask.infoAdicional.cotizacion} onChange={(e) => setNewTask({ ...newTask, infoAdicional: { ...newTask.infoAdicional, cotizacion: e.target.value } })} />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Monto</label>
+                  <input type="text" className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600" value={newTask.infoAdicional.monto} onChange={handleMontoChange} />
+                </div>
+              </div>
+              <div className="flex justify-end gap-4">
+                <button
+                  type="button"
+                  onClick={closeModal}
+                  className="px-6 py-2 rounded-lg text-slate-700 dark:text-slate-300 font-semibold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="px-6 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors"
+                >
+                  Crear Tarea
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de confirmación para crear tarea */}
+      {isConfirmTaskModalOpen && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-md">
+            <h2 className="text-2xl font-bold mb-4 text-slate-800 dark:text-slate-100">Confirmar Tarea</h2>
+            <p className="mb-4 text-slate-700 dark:text-slate-300">
+              ¿Estás seguro de que quieres crear la siguiente tarea?
+            </p>
+            <div className="bg-slate-50 dark:bg-slate-700 p-4 rounded-lg mb-4">
+              <p className="font-semibold text-slate-800 dark:text-slate-100">{taskToConfirm.title}</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">{taskToConfirm.description}</p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">Fecha de entrega: {taskToConfirm.dueDate}</p>
+            </div>
+            <div className="flex justify-end gap-4">
+              <button
+                type="button"
+                onClick={closeModal}
+                className="px-6 py-2 rounded-lg text-slate-700 dark:text-slate-300 font-semibold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmCreateTask}
+                className="px-6 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors"
+              >
+                Confirmar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de detalles de tarea */}
+      {isTaskDetailModalOpen && selectedTask && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-2xl">
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100">{selectedTask.title}</h2>
+              <button onClick={closeModal} className="p-1 rounded-full text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <p className="text-sm text-slate-500 dark:text-slate-400 mb-4">{selectedTask.description}</p>
+            <div className="space-y-4">
+              <div>
+                <p className="font-semibold text-slate-700 dark:text-slate-300">Estado:</p>
+                <span className="inline-block mt-1 px-3 py-1 rounded-full text-sm font-semibold text-white bg-sky-600">{statusMap[selectedTask.status]}</span>
+              </div>
+              {selectedTask.dueDate && (
+                <div>
+                  <p className="font-semibold text-slate-700 dark:text-slate-300">Fecha de Entrega:</p>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">{new Date(selectedTask.dueDate).toLocaleDateString()}</p>
+                </div>
+              )}
+              {Object.keys(selectedTask.infoAdicional).length > 0 && (
+                <div>
+                  <p className="font-semibold text-slate-700 dark:text-slate-300">Información Adicional:</p>
+                  <ul className="list-disc list-inside text-sm text-slate-500 dark:text-slate-400">
+                    {Object.entries(selectedTask.infoAdicional).map(([key, value]) => (
+                      value && <li key={key}><span className="font-medium capitalize">{key}:</span> {value}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal para actualizar el estado de la tarea (con comentario) */}
+      {isUpdateModalOpen && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-md">
+            <h2 className="text-2xl font-bold mb-4 text-slate-800 dark:text-slate-100">Actualizar Tarea</h2>
+            <p className="mb-4 text-slate-700 dark:text-slate-300">
+              Vas a cambiar el estado de la tarea a: <span className="font-semibold text-sky-600">{statusMap[taskToUpdate.newStatus]}</span>
+            </p>
+            <div className="mb-4">
+              <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-2" htmlFor="comment">Comentario</label>
+              <textarea
+                id="comment"
+                value={taskUpdateData.comment}
+                onChange={(e) => setTaskUpdateData({ ...taskUpdateData, comment: e.target.value })}
+                className="w-full px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg focus:ring-sky-500 focus:border-sky-500 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-100"
+                rows="3"
+              ></textarea>
+            </div>
+            <div className="flex justify-end gap-4">
+              <button
+                type="button"
+                onClick={closeModal}
+                className="px-6 py-2 rounded-lg text-slate-700 dark:text-slate-300 font-semibold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmUpdate}
+                className="px-6 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors"
+              >
+                Confirmar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal para crear un nuevo proyecto */}
+      {showProjectModal && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-md">
+            <h2 className="text-2xl font-bold mb-4 text-slate-800 dark:text-slate-100">Nuevo Proyecto</h2>
+            <div className="mb-4">
+              <label htmlFor="newProjectName" className="block text-slate-700 dark:text-slate-300 font-semibold mb-2">Nombre del Proyecto</label>
+              <input
+                type="text"
+                id="newProjectName"
+                value={newProjectName}
+                onChange={(e) => setNewProjectName(e.target.value)}
+                className="w-full px-4 py-2 border rounded-lg bg-slate-100 dark:bg-slate-700 dark:border-slate-600 focus:ring-sky-500 focus:border-sky-500 text-slate-800 dark:text-slate-100"
+                required
+              />
+            </div>
+            <div className="flex justify-end gap-4">
+              <button
+                onClick={closeModal}
+                className="px-6 py-2 rounded-lg text-slate-700 dark:text-slate-300 font-semibold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={handleCreateProject}
+                className="px-6 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors"
+              >
+                Crear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Auditoría de Historial */}
+      {historyModalOpen && selectedHistoryItem && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-2xl max-h-[80vh] overflow-y-auto">
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100">Auditoría de Tarea</h2>
+              <button onClick={closeModal} className="p-1 rounded-full text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">Tarea: {selectedHistoryItem.taskTitle}</p>
+            <ul className="space-y-4">
+              {selectedHistoryItem.fullHistory.map((entry, index) => (
+                <li key={index} className="border-l-4 border-sky-600 pl-4 py-2 bg-slate-50 dark:bg-slate-700 rounded-md">
+                  <p className="text-sm text-slate-800 dark:text-slate-200">
+                    <span className="font-semibold">{statusMap[entry.status]}</span> - {new Date(entry.timestamp.seconds * 1000).toLocaleString()}
+                  </p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{entry.change}</p>
+                  {entry.comment && (
+                    <p className="text-xs italic text-slate-500 dark:text-slate-400 mt-1">Comentario: {entry.comment}</p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Información de Usuario */}
+      {showUserInfoModal && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-md">
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100">Información del Usuario</h2>
+              <button onClick={closeModal} className="p-1 rounded-full text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex flex-col items-center gap-4">
+              <div className="h-24 w-24 rounded-full bg-sky-600 dark:bg-sky-600 text-white flex items-center justify-center text-4xl font-bold">
+                {userAvatar}
+              </div>
+              <p className="text-xl font-bold text-slate-800 dark:text-slate-100 break-all">ID de Usuario: <span className="font-normal text-sm">{userId}</span></p>
+              <div className="flex flex-wrap gap-2 justify-center">
+                {defaultEmojis.map(emoji => (
+                  <button
+                    key={emoji}
+                    onClick={() => handleUpdateAvatar(emoji)}
+                    className="p-3 rounded-full text-3xl hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+              <label className="block w-full text-center cursor-pointer px-4 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors">
+                Subir Imagen
+                <input type="file" className="hidden" accept="image/*" onChange={handleFileChange} />
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal del Asistente de Búsqueda */}
+      {isAssistantModalOpen && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl p-6 w-full max-w-3xl flex flex-col h-[80vh]">
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-2xl font-bold text-slate-800 dark:text-slate-100">Asistente de Búsqueda</h2>
+              <button onClick={closeModal} className="p-1 rounded-full text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            {/* Contenedor del chat */}
+            <div className="flex-1 overflow-y-auto p-4 border border-slate-200 dark:border-slate-700 rounded-lg mb-4 space-y-4">
+              {chatHistory.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-slate-400">
+                  Escribe una pregunta sobre tus proyectos o tareas.
+                </div>
+              ) : (
+                chatHistory.map((msg, index) => (
+                  <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`p-3 rounded-lg max-w-[80%] ${msg.role === 'user' ? 'bg-sky-600 text-white' : 'bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-100'}`}>
+                      <p>{msg.text}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+              {isAssistantLoading && (
+                <div className="flex justify-start">
+                  <div className="p-3 rounded-lg max-w-[80%] bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-100">
+                    <div className="w-4 h-4 rounded-full bg-slate-500 animate-pulse"></div>
+                  </div>
+                </div>
+              )}
+              <div ref={responseRef} />
+            </div>
+
+            {/* Formulario de entrada */}
+            <form onSubmit={handleAssistantSearch} className="flex gap-2">
+              <input
+                type="text"
+                value={assistantQuery}
+                onChange={(e) => setAssistantQuery(e.target.value)}
+                placeholder="Pregunta sobre tus tareas o proyectos..."
+                className="flex-1 px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg focus:ring-sky-500 focus:border-sky-500 bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-100"
+                disabled={isAssistantLoading}
+              />
+              <button
+                type="submit"
+                className="px-6 py-2 rounded-lg bg-sky-600 text-white font-semibold hover:bg-sky-700 transition-colors"
+                disabled={isAssistantLoading}
+              >
+                {isAssistantLoading ? (
+                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  'Enviar'
+                )}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
